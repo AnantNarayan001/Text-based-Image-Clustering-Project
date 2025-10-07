@@ -1,1 +1,1311 @@
+ 
+import matplotlib.pyplot as plt
+from sklearn.metrics import pairwise_distances
+import os
+import sys
+import cv2
+import random
+import numpy as np
+from glob import glob
+from tqdm import tqdm
+from PIL import Image
+from collections import Counter
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics import accuracy_score, adjusted_rand_score
+import torch
+import torch.nn as nn
+import torchvision.models as models
+import torchvision.transforms as T
+from torch.utils.data import Dataset, DataLoader
+from torchvision.models import ResNet50_Weights
+
+# Skimage
+from skimage.feature import hog, local_binary_pattern
+
+# Sklearn
+from sklearn.model_selection import train_test_split
+from sklearn.cluster import KMeans,DBSCAN
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.metrics import accuracy_score, adjusted_rand_score
+from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+from sklearn.svm import SVC
+
+from transformers import BlipProcessor, BlipForConditionalGeneration
+from sentence_transformers import SentenceTransformer
+
+#Global Variables (Parameters for feature extractions)
+SEED = 782
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+DATA_DIR = "imagenet"
+TEST_SPLIT = 0.2
+VAL_SPLIT = 0.2
+
+# Classical SIFT config
+MAX_DESCRIPTORS = 30_000_000
+K_SIFT = 512   # codebook size
+SIFT_WEIGHT = 2.0
+
+# HOG config
+HOG_ORIENTATIONS = 9
+HOG_PIXELS_PER_CELL = (8, 8)
+HOG_CELLS_PER_BLOCK = (2, 2)
+HOG_DIM = 512
+HOG_WEIGHT = 1.0
+
+# Color Hist config
+COLOR_BINS_PER_CHANNEL = 43  # => 129D
+COLOR_WEIGHT = 1.0
+
+# Canny config
+CANNY_THRESHOLD1 = 100
+CANNY_THRESHOLD2 = 200
+CANNY_GRID = (8, 8)  # => 64D
+CANNY_WEIGHT = 1.0
+
+# LBP config
+LBP_RADIUS = 1
+LBP_POINTS = 8  # => histogram dimension = 10
+LBP_WEIGHT = 1.0
+
+# K-Means classifier
+KMEANS_CLUSTERS = 90  # usually matches #classes
+
+# Deep Feature Extraction config
+BATCH_SIZE_DEEP = 32
+NUM_WORKERS_DEEP = 0  # or > 0 for speed if your CPU can handle
+DEVICE = 'cpu'        # or 'cuda' if you have a GPU
+
+# Scaling & PCA
+APPLY_SCALING = True
+APPLY_PCA = True
+PCA_N_COMPONENTS = 2700
+
+#Storage
+REUSE_classical = True
+REUSE_deep = True
+REUSE_text = True
+
+# Text (BLIP + SBERT) configs
+BATCH_SIZE_TEXT = 8
+NUM_WORKERS_TEXT = 0
+BLIP_MODEL_NAME = "Salesforce/blip-image-captioning-base"
+SBERT_MODEL_NAME = "all-mpnet-base-v2"
+MAX_NEW_TOKENS = 20
+
+#Classifical Feature Extraction
+
+###SIFT (512D Bag of Features)
+
+
+def create_sift_detector():
+    """
+    Creates an OpenCV SIFT detector (requires opencv-contrib-python >=4.4).
+    """
+    try:
+        return cv2.SIFT_create()
+    except AttributeError:
+        return cv2.xfeatures2d.SIFT_create()
+
+def extract_sift_descriptors(gray_8u, sift_detector):
+    """
+    Extracts SIFT descriptors from an 8-bit grayscale image.
+    Returns (num_keypoints, 128) or None if no keypoints.
+    """
+    kp, desc = sift_detector.detectAndCompute(gray_8u, None)
+    return desc
+
+def cluster_sift_descriptors_kmeans(all_desc, k=K_SIFT):
+    """
+    Clusters all SIFT descriptors into k visual words (Bag-of-Features codebook).
+    We subsample if needed, up to MAX_DESCRIPTORS.
+    Returns a fitted KMeans object (sklearn).
+    """
+    if all_desc.shape[0] > MAX_DESCRIPTORS:
+        idx = np.random.choice(all_desc.shape[0], MAX_DESCRIPTORS, replace=False)
+        all_desc = all_desc[idx]
+    print(f"[SIFT] Running KMeans for Bag-of-Features (k={k}), descriptors shape={all_desc.shape}...")
+    kmeans = KMeans(n_clusters=k, random_state=SEED, verbose=1)
+    kmeans.fit(all_desc)
+    print("[SIFT] KMeans clustering complete.")
+    return kmeans
+
+def build_sift_bof_histogram(desc, kmeans_model, k=K_SIFT):
+    """
+    Assign each local SIFT descriptor to nearest cluster => builds a k-dim histogram (Bag-of-Features).
+    L1-normalizes the histogram.
+    """
+    if desc is None or len(desc) == 0:
+        return np.zeros(k, dtype=np.float32)
+    cluster_idxs = kmeans_model.predict(desc)
+    hist, _ = np.histogram(cluster_idxs, bins=np.arange(k+1), range=(0, k))
+    hist = hist.astype(np.float32)
+    hist_sum = hist.sum()
+    if hist_sum > 0:
+        hist /= hist_sum
+    return hist
+
+#HOG(512D)
+
+def extract_hog_features(gray_8u):
+    """
+    Extracts HOG (skimage) => final dimension 512 by truncation/padding.
+    """
+    hog_desc = hog(
+        gray_8u.astype(np.float32) / 255.0,
+        orientations=HOG_ORIENTATIONS,
+        pixels_per_cell=HOG_PIXELS_PER_CELL,
+        cells_per_block=HOG_CELLS_PER_BLOCK,
+        block_norm='L2-Hys',
+        transform_sqrt=False,
+        feature_vector=True
+    )
+    # Force dimension = HOG_DIM (512)
+    if hog_desc.shape[0] > HOG_DIM:
+        hog_desc = hog_desc[:HOG_DIM]
+    elif hog_desc.shape[0] < HOG_DIM:
+        pad_len = HOG_DIM - hog_desc.shape[0]
+        hog_desc = np.concatenate([hog_desc, np.zeros(pad_len, dtype=np.float32)])
+    return hog_desc.astype(np.float32)
+
+###Color Histogram
+
+def extract_color_hist(img_bgr, bins_per_channel=COLOR_BINS_PER_CHANNEL):
+    """
+    Build a color histogram => 3 * bins_per_channel (~129D).
+    Each channel is float32[0,1], with (bins_per_channel) bins in [0,1].
+    """
+    chans = cv2.split(img_bgr)
+    feats = []
+    for ch in chans:
+        hist = cv2.calcHist([ch], [0], None, [bins_per_channel], [0,1])
+        hist = cv2.normalize(hist, hist).flatten()
+        feats.append(hist)
+    feats = np.concatenate(feats).astype(np.float32)
+    return feats
+
+###Canny Edge Detection
+
+def extract_canny_features(gray_8u, grid=CANNY_GRID,
+                           thresh1=CANNY_THRESHOLD1,
+                           thresh2=CANNY_THRESHOLD2):
+    """
+    1) Canny edge detection
+    2) 8x8 grid => each cell=8x8 => count edges in each cell => 64D
+    3) L1 normalize
+    """
+    edges = cv2.Canny(gray_8u, thresh1, thresh2)
+    h, w = edges.shape
+    gx, gy = grid
+    cell_h = h // gx
+    cell_w = w // gy
+
+    features = []
+    for i in range(gx):
+        for j in range(gy):
+            y1, y2 = i*cell_h, (i+1)*cell_h
+            x1, x2 = j*cell_w, (j+1)*cell_w
+            cell = edges[y1:y2, x1:x2]
+            count_edges = np.sum(cell > 0)
+            features.append(count_edges)
+    features = np.array(features, dtype=np.float32)
+    s = features.sum()
+    if s > 0:
+        features /= s
+    return features
+
+#LBP Features
+
+
+def extract_lbp_features(gray_8u, radius=LBP_RADIUS, n_points=LBP_POINTS):
+    """
+    Extract LBP => uniform patterns => 10D hist for n_points=8.
+    L1 normalize.
+    """
+    lbp = local_binary_pattern(gray_8u, n_points, radius, method='uniform')
+    hist_bins = n_points + 2
+    hist, _ = np.histogram(lbp.ravel(), bins=np.arange(hist_bins+1), range=(0, hist_bins))
+    hist = hist.astype(np.float32)
+    s = hist.sum()
+    if s > 0:
+        hist /= s
+    return hist
+
+###Extracting All CLassical Features 
+
+def extract_all_features_classical(paths, labels=None, kmeans_sift=None):
+    """
+    For each image path, build:
+        - SIFT -> 512D BoF (if kmeans_sift is not None)
+        - HOG  -> 512D
+        - Color-> ~129D
+        - Canny-> 64D
+        - LBP  -> 10D
+    Return a dict with arrays + 'Labels' if provided.
+    """
+    sift_bof_list = []
+    hog_list = []
+    color_list = []
+    canny_list = []
+    lbp_list = []
+
+    sift_detector = create_sift_detector()
+
+    for path in tqdm(paths, desc="Extracting Features"):
+        img_bgr = load_64x64_color_image(path)
+        if img_bgr is None:
+            # Could not load => fill with zeros
+            sift_bof_list.append(np.zeros(K_SIFT, dtype=np.float32))
+            hog_list.append(np.zeros(HOG_DIM, dtype=np.float32))
+            color_list.append(np.zeros(3*COLOR_BINS_PER_CHANNEL, dtype=np.float32))
+            canny_list.append(np.zeros(CANNY_GRID[0]*CANNY_GRID[1], dtype=np.float32))
+            lbp_list.append(np.zeros(LBP_POINTS+2, dtype=np.float32))
+            continue
+
+        gray_8u = convert_to_gray(img_bgr)
+
+        # SIFT
+        if kmeans_sift is not None:
+            desc = extract_sift_descriptors(gray_8u, sift_detector)
+            bof = build_sift_bof_histogram(desc, kmeans_sift, K_SIFT)
+        else:
+            # If kmeans_sift is None, we do not build a BoF yet
+            bof = np.zeros(K_SIFT, dtype=np.float32)
+        sift_bof_list.append(bof)
+
+        # HOG
+        hog_vec = extract_hog_features(gray_8u)
+        hog_list.append(hog_vec)
+
+        # Color
+        color_vec = extract_color_hist(img_bgr, COLOR_BINS_PER_CHANNEL)
+        color_list.append(color_vec)
+
+        # Canny
+        canny_vec = extract_canny_features(gray_8u, CANNY_GRID, CANNY_THRESHOLD1, CANNY_THRESHOLD2)
+        canny_list.append(canny_vec)
+
+        # LBP
+        lbp_vec = extract_lbp_features(gray_8u, LBP_RADIUS, LBP_POINTS)
+        lbp_list.append(lbp_vec)
+
+    feats_dict = {
+        "SIFT":  np.array(sift_bof_list, dtype=np.float32),
+        "HOG":   np.array(hog_list, dtype=np.float32),
+        "Color": np.array(color_list, dtype=np.float32),
+        "Canny": np.array(canny_list, dtype=np.float32),
+        "LBP":   np.array(lbp_list,   dtype=np.float32),
+    }
+    if labels is not None:
+        feats_dict["Labels"] = np.array(labels, dtype=np.int32)
+    return feats_dict
+Deep Features (CNN & Transformer Based)
+###ImageDataset for all Deep Models
+
+class ImageDataset():
+    """
+    Dataset that loads images from disk (64x64 or any size),
+    upscales to 224x224, transforms, etc.
+    """
+
+    def __init__(self, paths, labels=None, transform=None):
+        self.paths = paths
+        self.labels = labels
+        self.transform = transform
+
+        if self.labels is not None and len(self.paths) != len(self.labels):
+            raise ValueError("Mismatch between paths and labels length.")
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        p = self.paths[idx]
+        label = -1 if self.labels is None else self.labels[idx]
+        try:
+            img = Image.open(p).convert("RGB")
+        except Exception as e:
+            # if fail, produce a black 64x64
+            print(f"[Warning] fail loading {p}: {e}", file=sys.stderr)
+            img = Image.new("RGB", (64,64), color=(0,0,0))
+
+        if self.transform:
+            img = self.transform(img)
+
+        return img, label
+
+###RESNET152
+
+#Deep Features Extraction
+
+def create_resnet50_feature_extractor():
+    base_model = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
+    base_model.eval()
+    # strip final FC => keep up to global avgpool => 2048D
+    feature_extractor = nn.Sequential(*list(base_model.children())[:-1])
+    feature_extractor.eval()
+
+    # transform => upsample 64->224, etc.
+    transform = T.Compose([
+        T.Resize((224,224)),
+        T.ToTensor(),
+        T.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std =[0.229, 0.224, 0.225]
+        ),
+    ])
+    return feature_extractor, transform
+
+
+def extract_deep_features(paths, labels=None,
+                          batch_size=32, num_workers=0, device='cpu'):
+    """
+    Returns {"Deep": (N,2048), "Labels": (N,)} if labels is not None
+    """
+    feature_extractor, transform = create_resnet50_feature_extractor()
+    feature_extractor = feature_extractor.to(device)
+    feature_extractor.eval()
+
+    ds = ImageDataset(paths, labels=labels, transform=transform)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=False,
+                    num_workers=num_workers,
+                    pin_memory=(device != 'cpu'))
+
+    all_feats = []
+    all_labels = [] if labels is not None else None
+
+    with torch.no_grad():
+        for batch_imgs, batch_lbls in tqdm(dl, desc="Extracting Deep Feat"):
+            batch_imgs = batch_imgs.to(device)
+            feats = feature_extractor(batch_imgs)  # shape: (B,2048,1,1)
+            feats = feats.view(feats.size(0), -1)   # => (B,2048)
+            feats_np = feats.cpu().numpy()          # => (B,2048)
+            all_feats.append(feats_np)
+            if labels is not None:
+                all_labels.extend(batch_lbls.numpy().tolist())
+
+    all_feats = np.concatenate(all_feats, axis=0).astype(np.float32)
+    out_dict = {"Deep": all_feats}
+    if labels is not None:
+        out_dict["Labels"] = np.array(all_labels, dtype=np.int32)
+
+    return out_dict
+
+def concatenate_and_weight_features(feat_dict):
+    """
+    Merges (SIFT,HOG,Color,Canny,LBP) horizontally, applying user-defined weights.
+    Returns X of shape (N, total_dim) and y of shape (N,) if "Labels" in feat_dict.
+    """
+    # Weighted blocks
+    sift_bof = SIFT_WEIGHT  * feat_dict["SIFT"]
+    hog      = HOG_WEIGHT   * feat_dict["HOG"]
+    color    = COLOR_WEIGHT * feat_dict["Color"]
+    canny    = CANNY_WEIGHT * feat_dict["Canny"]
+    lbp      = LBP_WEIGHT   * feat_dict["LBP"]
+
+    X = np.hstack([sift_bof, hog, color, canny, lbp])
+    y = feat_dict.get("Labels", None)
+    return X, y
+
+
+##Textual Features (Captioning + Sentence Embeddings)
+###BLIP + SBERT
+
+
+def collate_blip_fn(batch):
+    imgs = [item[0] for item in batch]  # PIL images
+    lbls = [item[1] for item in batch]  # int labels
+    lbls_tensor = torch.tensor(lbls, dtype=torch.long)
+    return imgs, lbls_tensor
+
+class BlipImageDataset(Dataset):
+    """
+    Minimal dataset for BLIP: returns (PIL_image, label).
+    """
+    def __init__(self, paths, labels=None):
+        self.paths = paths
+        self.labels = labels
+        if self.labels is not None and len(self.paths) != len(self.labels):
+            raise ValueError("Mismatch in #paths vs #labels")
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        path = self.paths[idx]
+        label = -1 if self.labels is None else self.labels[idx]
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception as e:
+            print(f"[Warning] fail loading {path}: {e}", file=sys.stderr)
+            img = Image.new("RGB", (64,64), color=(0,0,0))
+        return img, label
+
+def extract_text_features_blip_sbert(paths, labels=None,
+                                     blip_model_name=BLIP_MODEL_NAME,
+                                     sbert_model_name=SBERT_MODEL_NAME,
+                                     batch_size=BATCH_SIZE_TEXT,
+                                     num_workers=NUM_WORKERS_TEXT,
+                                     device='cpu',
+                                     max_new_tokens=MAX_NEW_TOKENS):
+    """
+    1) Generate one caption per image via BLIP
+    2) Embed each caption via SBERT => 768D
+    Returns { "Captions": list[str], "TextEmbed": (N,embed_dim), "Labels": (N,) }
+    """
+    print(f"[INFO] Loading BLIP model: {blip_model_name}")
+    processor = BlipProcessor.from_pretrained(blip_model_name,use_fast = True)
+    blip_model = BlipForConditionalGeneration.from_pretrained(blip_model_name)
+    blip_model.to(device).eval()
+
+    print(f"[INFO] Loading SBERT model: {sbert_model_name}")
+    sbert_model = SentenceTransformer(sbert_model_name, device=device)
+
+    ds = BlipImageDataset(paths, labels=labels)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=False,
+                    num_workers=num_workers, pin_memory=(device!='cpu'),
+                    collate_fn=collate_blip_fn)
+
+    all_captions = []
+    all_labels = [] if labels is not None else None
+
+    print("[INFO] Generating captions with BLIP ...")
+    for batch_imgs, batch_lbls in tqdm(dl, desc="BLIP Captioning"):
+        inputs = processor(images=batch_imgs, return_tensors="pt").to(device)
+        with torch.no_grad():
+            out = blip_model.generate(**inputs, max_new_tokens=max_new_tokens)
+        for seq in out:
+            caption = processor.decode(seq, skip_special_tokens=True)
+            all_captions.append(caption)
+
+        if labels is not None:
+            all_labels.extend(batch_lbls.cpu().numpy().tolist())
+
+    print("[INFO] Embedding captions with SBERT ...")
+    text_embeddings = sbert_model.encode(all_captions,
+                                         batch_size=batch_size,
+                                         convert_to_numpy=True,
+                                         show_progress_bar=True)
+    text_embeddings = text_embeddings.astype(np.float32)
+
+    result = {
+        "Captions" : all_captions,
+        "TextEmbed": text_embeddings
+    }
+    if labels is not None:
+        result["Labels"] = np.array(all_labels, dtype=np.int32)
+    return result
+
+###Merging the Features
+def merge_classical_and_deep_feats(classical_dict, deep_dict):
+    """
+    classical_dict =>
+       "SIFT"  (N, K_SIFT)
+       "HOG"   list of (N) elements, each hog array can vary in length
+       "Color" (N, 3*COLOR_BINS_PER_CHANNEL)
+       "Canny" (N, 64)
+       "LBP"   (N, 10)
+    deep_dict =>
+       "Deep"  (N, 2048)
+
+    We'll horizontally stack them by:
+    [SIFT, HOG, Color, Canny, LBP, Deep]
+
+    IMPORTANT: Because HOG length can vary if images differ or we do big resizes,
+    we must ensure each image is the same size. Since we forcibly resize to 512x512,
+    each hog vector *should* have the same dimension. We'll verify by the first image.
+    """
+    sift_bof =  classical_dict["SIFT"]  # (N, K_SIFT)
+    color    = classical_dict["Color"] # (N, 3*bins)
+    canny    = classical_dict["Canny"] # (N, 64)
+    lbp      = classical_dict["LBP"]   # (N, 10)
+    deep_feats = deep_dict["Deep"]                    # (N, 2048)
+
+    # Convert the list of hog arrays into a single 2D array
+    # (N, hog_dim).  We'll check dimension from the first.
+    hog_list = [np.array(hog) for hog in classical_dict["HOG"]]
+    hog_dim = hog_list[0].shape[0] if len(hog_list) > 0 else 0
+    hog_stack = np.zeros((len(hog_list), hog_dim), dtype=np.float32)
+
+    for i, hv in enumerate(hog_list):
+        hog_stack[i, :] = hv
+
+    hog_stack *= HOG_WEIGHT  # (N, hog_dim)
+
+    # Now combine everything horizontally
+    X_classical = np.hstack([sift_bof, hog_stack, color, canny, lbp])
+    X_combined  = np.hstack([X_classical, deep_feats])
+    X_deep =np.hstack([deep_feats])
+
+    y = classical_dict["Labels"]
+    return X_combined, y, X_classical, y, X_deep, y
+
+## Clustering Models & Evaluation
+###K-Means From Scratch
+
+def kmeans_plus_plus_init(X, k, random_state=42):
+    rng = np.random.default_rng(random_state)
+    N, D = X.shape
+
+    # pick first center randomly
+    first_idx = rng.integers(0, N)
+    centers = [X[first_idx]]
+
+    for _ in range(k - 1):
+        # Distances to nearest center
+        dists = np.full(N, np.inf, dtype=np.float64)
+        for c in centers:
+            dist_sq = np.sum((X - c)**2, axis=1)
+            dists = np.minimum(dists, dist_sq)
+        prob = dists / np.sum(dists)
+        next_idx = rng.choice(N, p=prob)
+        centers.append(X[next_idx])
+    return np.array(centers, dtype=np.float64)
+
+def pairwise_distances(X, centers):
+    N, D = X.shape
+    k, _ = centers.shape
+    dist = np.empty((N, k), dtype=np.float64)
+    for j in range(k):
+        diff = X - centers[j]
+        dist[:, j] = np.sum(diff*diff, axis=1)
+    return dist
+
+def compute_inertia(X, centers, labels):
+    """
+    Compute inertia: sum of squared distances of samples to their closest cluster center
+    """
+    inertia = 0.0
+    for i in range(X.shape[0]):
+        center = centers[labels[i]]
+        inertia += np.sum((X[i] - center) ** 2)
+    return inertia
+
+def plot_elbow_curve(X, k_range, random_state=42):
+    inertias = []
+
+    for k in tqdm(k_range, desc="Computing Elbow Curve"):
+        centers, labels = kmeans_advanced(X, k, random_state=random_state)
+        inertia = compute_inertia(X, centers, labels)
+        inertias.append(inertia)
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(k_range, inertias, marker='o', linestyle='-', color='purple')
+    plt.xticks(k_range)
+    plt.xlabel("Number of Clusters (k)")
+    plt.ylabel("Inertia (Sum of Squared Distances)")
+    plt.title("Elbow Curve for K-Means")
+    plt.grid(True)
+    plt.show()
+
+def kmeans_advanced(X, k, max_iter=300, tol=1e-4, init="kmeans++", random_state=42):
+    """
+    From-scratch K-Means:
+     - k-means++ initialization
+     - pairwise distance computation
+     - re-init empty clusters
+     - tolerance-based convergence
+    """
+    rng = np.random.default_rng(random_state)
+    N, D = X.shape
+
+    if init == "kmeans++":
+        centers = kmeans_plus_plus_init(X, k, random_state)
+    elif init == "random":
+        idx = rng.choice(N, size=k, replace=False)
+        centers = X[idx].astype(np.float64)
+    else:
+        raise ValueError("init must be 'kmeans++' or 'random'")
+
+    labels = np.zeros(N, dtype=np.int32)
+    for iteration in tqdm(range(max_iter), desc="K-Means Iter"):
+        dist = pairwise_distances(X, centers)
+        new_labels = np.argmin(dist, axis=1)
+
+        # if no change in labels => converged
+        if np.all(labels == new_labels):
+            break
+
+        labels = new_labels
+
+        new_centers = np.zeros((k, D), dtype=np.float64)
+        counts = np.zeros(k, dtype=np.int32)
+        for i in range(N):
+            c_idx = labels[i]
+            new_centers[c_idx] += X[i]
+            counts[c_idx] += 1
+        for c_idx in range(k):
+            if counts[c_idx] == 0:
+                # re-init if empty cluster
+                rand_idx = rng.integers(0, N)
+                new_centers[c_idx] = X[rand_idx]
+                counts[c_idx] = 1
+            else:
+                new_centers[c_idx] /= counts[c_idx]
+
+        shift = np.sqrt(np.sum((centers - new_centers)**2))
+        centers = new_centers
+        if shift < tol:
+            break
+
+    return centers, labels
+
+
+def majority_label_for_clusters(labels_train, clusters_train, k):
+    """
+    Each cluster is assigned the majority label of the training samples
+    that fall in that cluster. If a cluster is empty, assign -1 (unlabeled).
+    """
+    cluster_label_map = np.zeros(k, dtype=np.int32)
+    for c_idx in range(k):
+        mask = (clusters_train == c_idx)
+        if not np.any(mask):
+            cluster_label_map[c_idx] = -1
+            continue
+        cluster_labels = labels_train[mask]
+        vals, counts = np.unique(cluster_labels, return_counts=True)
+        majority_class = vals[np.argmax(counts)]
+        cluster_label_map[c_idx] = majority_class
+    return cluster_label_map
+
+def classify_with_kmeans(X, centers, cluster_label_map):
+    dist = pairwise_distances(X, centers)
+    nearest = np.argmin(dist, axis=1)
+    preds = cluster_label_map[nearest]
+    return preds
+
+###Agglomerative Clustering
+
+#Clustering Helpers
+
+def majority_label_for_dbscan(labels_train, clusters_train):
+    unique_clusters = np.unique(clusters_train)
+    cluster_label_map = {}
+
+    for c_idx in unique_clusters:
+        mask = (clusters_train == c_idx)
+        if not np.any(mask):
+            cluster_label_map[c_idx] = -1
+            continue
+
+        cluster_labels = labels_train[mask]
+        vals, counts = np.unique(cluster_labels, return_counts=True)
+        majority_class = vals[np.argmax(counts)]
+        cluster_label_map[c_idx] = majority_class
+
+    return cluster_label_map
+
+def predict_with_dbscan(X_train, train_cluster_assignments, X_test, cluster_label_map):
+    # Find nearest training sample for each test sample
+    test_preds = classify_by_nearest_train(X_test, X_train, train_cluster_assignments)
+
+    # Map cluster assignments to class labels
+    result = np.zeros(len(test_preds), dtype=np.int32)
+    for i, cluster in enumerate(test_preds):
+        result[i] = cluster_label_map.get(cluster, -1)
+
+    return result
+
+def run_hierarchical_clustering(X_train, y_train, X_val, y_val, X_test, y_test, n_clusters=30, linkage='ward'):
+    print(f"\n[INFO] Running Hierarchical Clustering with {n_clusters} clusters, {linkage} linkage...")
+
+    # Train the model
+    agg_model = AgglomerativeClustering(n_clusters=n_clusters, linkage=linkage)
+    train_agg_labels = agg_model.fit_predict(X_train)
+
+    # Map clusters to majority labels
+    cluster_map_agg = majority_label_for_dbscan(y_train, train_agg_labels)
+
+    # Predict on validation set
+    val_pred_agg = predict_with_dbscan(X_train, train_agg_labels, X_val, cluster_map_agg)
+    val_acc_agg = accuracy_score(y_val, val_pred_agg)
+    val_ari_agg = adjusted_rand_score(y_val, val_pred_agg)
+    print(f"[Hierarchical] Val Accuracy= {val_acc_agg:.4f}, Val ARI= {val_ari_agg:.4f}")
+
+    # Predict on test set
+    test_pred_agg = predict_with_dbscan(X_train, train_agg_labels, X_test, cluster_map_agg)
+    test_acc_agg = accuracy_score(y_test, test_pred_agg)
+    test_ari_agg = adjusted_rand_score(y_test, test_pred_agg)
+    print(f"[Hierarchical] Test Accuracy= {test_acc_agg:.4f}, Test ARI= {test_ari_agg:.4f}")
+
+    # Visualization code could be added here for hierarchical clusters
+
+    return {
+        'val_accuracy': val_acc_agg,
+        'val_ari': val_ari_agg,
+        'test_accuracy': test_acc_agg,
+        'test_ari': test_ari_agg
+    }
+#Agglomerative Clustering and K means
+def run_agglomerative_clustering(X_train_all, y_train_all, X_val_all, y_val_all, X_test_all, y_test_all):
+    print("\n[INFO] Running Agglomerative Clustering (sklearn) ...")
+    n_clusters_agg = 54  # Can be tuned based on dataset
+    linkage_options = ['ward','complete','average']
+
+    best_val_acc = 0
+    best_linkage = None
+    best_results = None
+
+    # Try different linkage methods
+    for linkage_agg in linkage_options:
+        print(f"\n[INFO] Testing linkage method: {linkage_agg}")
+
+        # Train the model
+        agg_model = AgglomerativeClustering(n_clusters=n_clusters_agg, linkage=linkage_agg)
+        train_agg_labels = agg_model.fit_predict(X_train_all)
+
+        # Map clusters to majority labels
+        cluster_map_agg = majority_label_for_dbscan(y_train_all, train_agg_labels)
+
+        # Predict on validation set
+        val_pred_agg = predict_with_dbscan(X_train_all, train_agg_labels, X_val_all, cluster_map_agg)
+        val_acc_agg = accuracy_score(y_val_all, val_pred_agg)
+        val_ari_agg = adjusted_rand_score(y_val_all, val_pred_agg)
+        print(f"[Agglomerative {linkage_agg}] Val Accuracy= {val_acc_agg:.4f}, Val ARI= {val_ari_agg:.4f}")
+
+        # Track best performance
+        if val_acc_agg > best_val_acc:
+            best_val_acc = val_acc_agg
+            best_linkage = linkage_agg
+
+            # Predict on test set
+            test_pred_agg = predict_with_dbscan(X_train_all, train_agg_labels, X_test_all, cluster_map_agg)
+            test_acc_agg = accuracy_score(y_test_all, test_pred_agg)
+            test_ari_agg = adjusted_rand_score(y_test_all, test_pred_agg)
+            best_results = {
+                'linkage': linkage_agg,
+                'val_accuracy': val_acc_agg,
+                'val_ari': val_ari_agg,
+                'test_accuracy': test_acc_agg,
+                'test_ari': test_ari_agg
+            }
+
+    print(f"\n[INFO] Best Agglomerative Clustering results with linkage={best_linkage}:")
+    print(f"[Agglomerative] Val Accuracy= {best_results['val_accuracy']:.4f}, Val ARI= {best_results['val_ari']:.4f}")
+    print(f"[Agglomerative] Test Accuracy= {best_results['test_accuracy']:.4f}, Test ARI= {best_results['test_ari']:.4f}")
+
+    # Visualize clusters with t-SNE
+    visualize_agglomerative_clusters(X_train_all, y_train_all, best_linkage, n_clusters_agg)
+
+    return best_results
+
+def visualize_agglomerative_clusters(X_train, y_train, linkage_method, n_clusters, random_state=42):
+    """
+    Visualize agglomerative clusters using t-SNE
+    """
+    import matplotlib.pyplot as plt
+    from sklearn.manifold import TSNE
+
+    print("[INFO] Visualizing Agglomerative clusters with t-SNE...")
+
+    # Run agglomerative clustering
+    agg_model = AgglomerativeClustering(n_clusters=n_clusters, linkage=linkage_method)
+    clusters = agg_model.fit_predict(X_train)
+
+    # Apply t-SNE for visualization
+    tsne = TSNE(n_components=2, random_state=random_state, perplexity=30, n_iter=1000)
+    X_tsne = tsne.fit_transform(X_train)
+
+    # Create plots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
+
+    # Plot 1: Show clusters
+    scatter1 = ax1.scatter(X_tsne[:, 0], X_tsne[:, 1], c=clusters, cmap='viridis', alpha=0.7, s=30)
+    ax1.set_title(f'Agglomerative Clustering (n={n_clusters}, linkage={linkage_method})')
+    ax1.set_xlabel('t-SNE Component 1')
+    ax1.set_ylabel('t-SNE Component 2')
+    fig.colorbar(scatter1, ax=ax1, label='Cluster')
+    ax1.grid(alpha=0.3)
+
+    # Plot 2: Show true labels
+    scatter2 = ax2.scatter(X_tsne[:, 0], X_tsne[:, 1], c=y_train, cmap='viridis', alpha=0.7, s=30)
+    ax2.set_title('True Labels')
+    ax2.set_xlabel('t-SNE Component 1')
+    ax2.set_ylabel('t-SNE Component 2')
+    fig.colorbar(scatter2, ax=ax2, label='True Label')
+    ax2.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('agglomerative_clusters_tsne.png')
+    plt.show()
+
+def majority_label_for_clusters(labels_train, clusters_train, k):
+    cluster_label_map = np.zeros(k, dtype=np.int32)
+    for c_idx in range(k):
+        mask = (clusters_train == c_idx)
+        if not np.any(mask):
+            # handle empty cluster
+            cluster_label_map[c_idx] = -1
+            continue
+        cluster_labels = labels_train[mask]
+        vals, counts = np.unique(cluster_labels, return_counts=True)
+        majority_class = vals[np.argmax(counts)]
+        cluster_label_map[c_idx] = majority_class
+    return cluster_label_map
+
+def pairwise_distances(X, Y):
+    # naive O(N*M*D) approach
+    # returns dist[i, j] = ||X[i] - Y[j]||^2
+    # for classification with dbscan/kmeans
+    N, D = X.shape
+    M, _ = Y.shape
+    dist = np.empty((N, M), dtype=np.float32)
+    for j in range(M):
+        diff = X - Y[j]
+        dist[:, j] = np.sum(diff*diff, axis=1)
+    return dist
+
+def classify_by_nearest_train(X_test, X_train, train_cluster_assignments):
+    """
+    A naive approach for cluster-based classification with methods
+    that do not define a 'predict' for new data (like DBSCAN).
+    For each test sample => find the nearest training sample =>
+    assign the same cluster label.
+    """
+    dists = pairwise_distances(X_test, X_train)  # shape (Ntest, Ntrain)
+    nearest_idx = np.argmin(dists, axis=1)
+    assigned_clusters = train_cluster_assignments[nearest_idx]
+    return assigned_clusters
+
+###Evaluation & TSNE Plots on KMeans and Agglomerative Clustering
+
+import pickle
+import numpy as np
+import os
+from sklearn.metrics import accuracy_score, adjusted_rand_score
+
+
+def run_all_evaluations(X_train_all,y_train_all,X_val_all,y_val_all,X_test_all,y_test_all):
+
+    #--------------------------------------------------------------------------
+    # 7) Scale + PCA
+    #--------------------------------------------------------------------------
+    if APPLY_SCALING:
+        print("[INFO] Applying StandardScaler...")
+        scaler = StandardScaler()
+        scaler.fit(X_train_all)
+        X_train_all = scaler.transform(X_train_all)
+        X_val_all   = scaler.transform(X_val_all)
+        X_test_all  = scaler.transform(X_test_all)
+
+    if APPLY_PCA:
+
+        pca = PCA(n_components=0.95, random_state=SEED)
+        pca.fit(X_train_all)
+        X_train_all = pca.transform(X_train_all)
+        X_val_all   = pca.transform(X_val_all)
+        X_test_all  = pca.transform(X_test_all)
+        print(f"[INFO] PCA variance ratio sum= {pca.explained_variance_ratio_.sum():.4f}")
+
+    print("[INFO] Running from-scratch K-Means classification...")
+    centers, clusters_train = kmeans_advanced(
+        X_train_all, k=KMEANS_CLUSTERS, max_iter=300, tol=1e-4,
+        init="kmeans++", random_state=SEED
+    )
+    cluster_label_map = majority_label_for_clusters(y_train_all, clusters_train, KMEANS_CLUSTERS)
+
+    # Val
+    val_preds = classify_with_kmeans(X_val_all, centers, cluster_label_map)
+    val_acc = accuracy_score(y_val_all, val_preds)
+    val_ari = adjusted_rand_score(y_val_all, val_preds)
+    print(f"[K-Means] Val Accuracy= {val_acc:.4f}, Val ARI= {val_ari:.4f}")
+
+    # Test
+    test_preds = classify_with_kmeans(X_test_all, centers, cluster_label_map)
+    test_acc = accuracy_score(y_test_all, test_preds)
+    test_ari = adjusted_rand_score(y_test_all, test_preds)
+    print(f"[K-Means] Test Accuracy= {test_acc:.4f}, Test ARI= {test_ari:.4f}")
+    print("[INFO] Running from-scratch K-Means classification...")
+
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from sklearn.manifold import TSNE
+
+    print("[INFO] Visualizing K-means clusters with t-SNE...")
+
+    # Combine training data and cluster centers for a single t-SNE fit
+    combined_data = np.vstack((X_train_all, centers))
+    tsne = TSNE(n_components=2, random_state=SEED, perplexity=30, n_iter=1000)
+    combined_tsne = tsne.fit_transform(combined_data)
+
+    # Separate transformed training data and cluster centers
+    X_train_tsne = combined_tsne[:len(X_train_all)]
+    centers_tsne = combined_tsne[len(X_train_all):]
+
+    # === Plot 1: K-means cluster visualization ===
+    plt.figure(figsize=(10, 8))
+    scatter = plt.scatter(X_train_tsne[:, 0], X_train_tsne[:, 1],
+                        c=clusters_train, cmap='viridis', alpha=0.7, s=30)
+
+    # Plot cluster centers
+    plt.scatter(centers_tsne[:, 0], centers_tsne[:, 1],
+                c='red', marker='X', s=200, edgecolors='black', label='Cluster Centers')
+
+    plt.colorbar(scatter, label='Cluster Label')
+    plt.title('t-SNE Visualization of K-means Clusters')
+    plt.xlabel('t-SNE Component 1')
+    plt.ylabel('t-SNE Component 2')
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('kmeans_clusters_tsne.png')
+    plt.show()
+
+    # === Plot 2: True labels visualization ===
+    plt.figure(figsize=(10, 8))
+    scatter = plt.scatter(X_train_tsne[:, 0], X_train_tsne[:, 1],
+                        c=y_train_all, cmap='viridis', alpha=0.7, s=30)
+
+    plt.colorbar(scatter, label='True Label')
+    plt.title('t-SNE Visualization with True Labels')
+    plt.xlabel('t-SNE Component 1')
+    plt.ylabel('t-SNE Component 2')
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('true_labels_tsne.png')
+    plt.show()
+    run_agglomerative_clustering(X_train_all, y_train_all, X_val_all, y_val_all, X_test_all, y_test_all)
+
+##Main Pipeline ( 60/20/20 Train-Test-Val Split, feature extraction, Evaluation and Hyper parameter Tuning )
+
+
+def main_pipeline():
+    print("[INFO] Loading dataset paths...")
+    all_paths, all_labels, class_names = load_dataset_paths(DATA_DIR)
+    print(f"Total images: {len(all_paths)}, Classes: {len(class_names)}")
+
+    # Split the dataset
+    print("[INFO] Splitting dataset 60/20/20 ...")
+    train_paths, train_labels, val_paths, val_labels, test_paths, test_labels = split_dataset(
+        all_paths, all_labels, TEST_SPLIT, VAL_SPLIT, SEED
+    )
+    print(f"Train size= {len(train_paths)}, Val size= {len(val_paths)}, Test size= {len(test_paths)}")
+
+    #--------------------------------------------------------------------------
+    # 1) SIFT Codebook (KMeans) caching
+    #--------------------------------------------------------------------------
+    codebook_pickle_path = "sift_codebook_kmeans.pkl"
+
+    if os.path.exists(codebook_pickle_path):
+        print(f"[INFO] Loading existing SIFT codebook from {codebook_pickle_path}")
+        with open(codebook_pickle_path, "rb") as f:
+            kmeans_sift = pickle.load(f)
+    else:
+        print("[INFO] Collecting Train SIFT descriptors...")
+        desc_list = []
+        sift_detector = create_sift_detector()
+
+        for p in tqdm(train_paths, desc="Collecting Train SIFT"):
+            img_bgr =  load_64x64_color_image(p)
+            if img_bgr is None:
+                continue
+            gray_8u = convert_to_gray(img_bgr)
+            desc = extract_sift_descriptors(gray_8u, sift_detector)
+            if desc is not None and len(desc) > 0:
+                desc_list.append(desc)
+
+        if len(desc_list) == 0:
+            raise ValueError("No SIFT descriptors found for training set!")
+        all_train_desc = np.vstack(desc_list)
+        print(f"[INFO] All train SIFT descriptors shape= {all_train_desc.shape}")
+
+        print(f"[INFO] Fitting KMeans codebook (k={K_SIFT}) for SIFT...")
+        kmeans_sift = cluster_sift_descriptors_kmeans(all_train_desc, k=K_SIFT)
+
+        with open(codebook_pickle_path, "wb") as f:
+            pickle.dump(kmeans_sift, f)
+        print(f"[INFO] Saved SIFT codebook to {codebook_pickle_path}")
+
+    #--------------------------------------------------------------------------
+    # 2) Classical features caching: train, val, test
+    #--------------------------------------------------------------------------
+    classical_cache_train = "train_classical_feats.npz"
+    classical_cache_val   = "val_classical_feats.npz"
+    classical_cache_test  = "test_classical_feats.npz"
+
+    if os.path.exists(classical_cache_train) and REUSE_classical:
+        print(f"[INFO] Loading cached train classical features from {classical_cache_train}")
+        data_train = np.load(classical_cache_train, allow_pickle=True)
+        train_classical = {
+            "SIFT":  data_train["SIFT"],
+            "HOG":   data_train["HOG"].tolist(),
+            "Color": data_train["Color"],
+            "Canny": data_train["Canny"],
+            "LBP":   data_train["LBP"],
+            "Labels": data_train["Labels"],
+        }
+    else:
+        print("[INFO] Extracting classical features (train set)...")
+        train_classical = extract_all_features_classical(train_paths, train_labels, kmeans_sift)
+        # We must store HOG as an object array or list, so we do:
+        np.savez(
+            classical_cache_train,
+            SIFT=train_classical["SIFT"],
+            HOG=np.array(train_classical["HOG"], dtype=object),
+            Color=train_classical["Color"],
+            Canny=train_classical["Canny"],
+            LBP=train_classical["LBP"],
+            Labels=train_classical["Labels"]
+        )
+        print(f"[INFO] Saved train classical features to {classical_cache_train}")
+
+    if os.path.exists(classical_cache_val) and REUSE_classical:
+        print(f"[INFO] Loading cached val classical features from {classical_cache_val}")
+        data_val = np.load(classical_cache_val, allow_pickle=True)
+        val_classical = {
+            "SIFT":  data_val["SIFT"],
+            "HOG":   data_val["HOG"].tolist(),
+            "Color": data_val["Color"],
+            "Canny": data_val["Canny"],
+            "LBP":   data_val["LBP"],
+            "Labels": data_val["Labels"],
+        }
+    else:
+        print("[INFO] Extracting classical features (val set)...")
+        val_classical = extract_all_features_classical(val_paths, val_labels, kmeans_sift)
+        np.savez(
+            classical_cache_val,
+            SIFT=val_classical["SIFT"],
+            HOG=np.array(val_classical["HOG"], dtype=object),
+            Color=val_classical["Color"],
+            Canny=val_classical["Canny"],
+            LBP=val_classical["LBP"],
+            Labels=val_classical["Labels"]
+        )
+        print(f"[INFO] Saved val classical features to {classical_cache_val}")
+
+    if os.path.exists(classical_cache_test) and REUSE_classical:
+        print(f"[INFO] Loading cached test classical features from {classical_cache_test}")
+        data_test = np.load(classical_cache_test, allow_pickle=True)
+        test_classical = {
+            "SIFT":  data_test["SIFT"],
+            "HOG":   data_test["HOG"].tolist(),
+            "Color": data_test["Color"],
+            "Canny": data_test["Canny"],
+            "LBP":   data_test["LBP"],
+            "Labels": data_test["Labels"],
+        }
+    else:
+        print("[INFO] Extracting classical features (test set)...")
+        test_classical = extract_all_features_classical(test_paths, test_labels, kmeans_sift)
+        np.savez(
+            classical_cache_test,
+            SIFT=test_classical["SIFT"],
+            HOG=np.array(test_classical["HOG"], dtype=object),
+            Color=test_classical["Color"],
+            Canny=test_classical["Canny"],
+            LBP=test_classical["LBP"],
+            Labels=test_classical["Labels"]
+        )
+        print(f"[INFO] Saved test classical features to {classical_cache_test}")
+
+    #--------------------------------------------------------------------------
+    # 3) Extract deep features (optionally cached)
+    #--------------------------------------------------------------------------
+    deep_cache_train = "train_deep_feats.npz"
+    deep_cache_val   = "val_deep_feats.npz"
+    deep_cache_test  = "test_deep_feats.npz"
+
+    if os.path.exists(deep_cache_train) and REUSE_deep:
+        print(f"[INFO] Loading cached train deep features from {deep_cache_train}")
+        data_deep_train = np.load(deep_cache_train, allow_pickle=True)
+        train_deep = {
+            "Deep": data_deep_train["Deep"],
+            "Labels": data_deep_train["Labels"]
+        }
+    else:
+        print("[INFO] Extracting deep features (train set) ...")
+        train_deep = extract_deep_features(train_paths, train_labels,
+                                           batch_size=BATCH_SIZE_DEEP,
+                                           num_workers=NUM_WORKERS_DEEP,
+                                           device=DEVICE)
+        np.savez(
+            deep_cache_train,
+            Deep=train_deep["Deep"],
+            Labels=train_deep["Labels"]
+        )
+
+    if os.path.exists(deep_cache_val) and REUSE_deep:
+        print(f"[INFO] Loading cached val deep features from {deep_cache_val}")
+        data_deep_val = np.load(deep_cache_val, allow_pickle=True)
+        val_deep = {
+            "Deep": data_deep_val["Deep"],
+            "Labels": data_deep_val["Labels"]
+        }
+    else:
+        print("[INFO] Extracting deep features (val set) ...")
+        val_deep = extract_deep_features(val_paths, val_labels,
+                                         batch_size=BATCH_SIZE_DEEP,
+                                         num_workers=NUM_WORKERS_DEEP,
+                                         device=DEVICE)
+        np.savez(
+            deep_cache_val,
+            Deep=val_deep["Deep"],
+            Labels=val_deep["Labels"]
+        )
+
+    if os.path.exists(deep_cache_test) and REUSE_deep:
+        print(f"[INFO] Loading cached test deep features from {deep_cache_test}")
+        data_deep_test = np.load(deep_cache_test, allow_pickle=True)
+        test_deep = {
+            "Deep": data_deep_test["Deep"],
+            "Labels": data_deep_test["Labels"]
+        }
+    else:
+        print("[INFO] Extracting deep features (test set) ...")
+        test_deep = extract_deep_features(test_paths, test_labels,
+                                          batch_size=BATCH_SIZE_DEEP,
+                                          num_workers=NUM_WORKERS_DEEP,
+                                          device=DEVICE)
+        np.savez(
+            deep_cache_test,
+            Deep=test_deep["Deep"],
+            Labels=test_deep["Labels"]
+        )
+
+    #--------------------------------------------------------------------------
+    # 4) Text features (BLIP + SBERT)
+    #--------------------------------------------------------------------------
+    text_cache_train = "train_text_feats.npz"
+    text_cache_val   = "val_text_feats.npz"
+    text_cache_test  = "test_text_feats.npz"
+
+    def load_text_feats(cache_path):
+        dd = np.load(cache_path, allow_pickle=True)
+        return {
+            "Captions" : dd["Captions"].tolist(),
+            "TextEmbed": dd["TextEmbed"],
+            "Labels"   : dd["Labels"]
+        }
+
+    # train
+    if os.path.exists(text_cache_train) and REUSE_text:
+        print(f"[INFO] Loading cached train text feats from {text_cache_train}")
+        dtr = np.load(text_cache_train, allow_pickle=True)
+        train_text = {
+            "Captions" : dtr["Captions"].tolist(),
+            "TextEmbed": dtr["TextEmbed"],
+            "Labels"   : dtr["Labels"]
+        }
+    else:
+        print("[INFO] Extracting text features (train set) ...")
+        train_text = extract_text_features_blip_sbert(
+            train_paths, train_labels,
+            blip_model_name=BLIP_MODEL_NAME,
+            sbert_model_name=SBERT_MODEL_NAME,
+            batch_size=BATCH_SIZE_TEXT,
+            num_workers=NUM_WORKERS_TEXT,
+            device=DEVICE,
+            max_new_tokens=MAX_NEW_TOKENS
+        )
+        np.savez(
+            text_cache_train,
+            Captions=np.array(train_text["Captions"], dtype=object),
+            TextEmbed=train_text["TextEmbed"],
+            Labels=train_text["Labels"]
+        )
+
+    # val
+    if os.path.exists(text_cache_val) and REUSE_text:
+        print(f"[INFO] Loading cached val text feats from {text_cache_val}")
+        dv = np.load(text_cache_val, allow_pickle=True)
+        val_text = {
+            "Captions" : dv["Captions"].tolist(),
+            "TextEmbed": dv["TextEmbed"],
+            "Labels"   : dv["Labels"]
+        }
+    else:
+        print("[INFO] Extracting text features (val set) ...")
+        val_text = extract_text_features_blip_sbert(
+            val_paths, val_labels,
+            blip_model_name=BLIP_MODEL_NAME,
+            sbert_model_name=SBERT_MODEL_NAME,
+            batch_size=BATCH_SIZE_TEXT,
+            num_workers=NUM_WORKERS_TEXT,
+            device=DEVICE,
+            max_new_tokens=MAX_NEW_TOKENS
+        )
+        np.savez(
+            text_cache_val,
+            Captions=np.array(val_text["Captions"], dtype=object),
+            TextEmbed=val_text["TextEmbed"],
+            Labels=val_text["Labels"]
+        )
+
+    # test
+    if os.path.exists(text_cache_test) and REUSE_text:
+        print(f"[INFO] Loading cached test text feats from {text_cache_test}")
+        dte = np.load(text_cache_test, allow_pickle=True)
+        test_text = {
+            "Captions" : dte["Captions"].tolist(),
+            "TextEmbed": dte["TextEmbed"],
+            "Labels"   : dte["Labels"]
+        }
+    else:
+        print("[INFO] Extracting text features (test set) ...")
+        test_text = extract_text_features_blip_sbert(
+            test_paths, test_labels,
+            blip_model_name=BLIP_MODEL_NAME,
+            sbert_model_name=SBERT_MODEL_NAME,
+            batch_size=BATCH_SIZE_TEXT,
+            num_workers=NUM_WORKERS_TEXT,
+            device=DEVICE,
+            max_new_tokens=MAX_NEW_TOKENS
+        )
+        np.savez(
+            text_cache_test,
+            Captions=np.array(test_text["Captions"], dtype=object),
+            TextEmbed=test_text["TextEmbed"],
+            Labels=test_text["Labels"]
+        )
+
+    #--------------------------------------------------------------------------
+    # 5) Merge classical + deep => "image-based" features
+    #--------------------------------------------------------------------------
+    print("[INFO] Merging classical + deep => 'image-based' features ...")
+    X_train_img, y_train_img, X_train_classical, y_train_classical, X_train_deep, y_train_deep = merge_classical_and_deep_feats(train_classical, train_deep)
+    X_val_img,   y_val_img,X_val_classical, y_val_classical, X_val_deep, y_val_deep  = merge_classical_and_deep_feats(val_classical,   val_deep)
+    X_test_img,  y_test_img,X_test_classical, y_test_classical, X_test_deep, y_test_deep  = merge_classical_and_deep_feats(test_classical,  test_deep)
+    print(f"Image-based dims => train= {X_train_img.shape}, val= {X_val_img.shape}, test= {X_test_img.shape}")
+
+    # Also keep text-based
+    X_train_text = train_text["TextEmbed"]  # (N, 768)
+    y_train_text = train_text["Labels"]
+    X_val_text   = val_text["TextEmbed"]
+    y_val_text   = val_text["Labels"]
+    X_test_text  = test_text["TextEmbed"]
+    y_test_text  = test_text["Labels"]
+
+    #--------------------------------------------------------------------------
+    # 6) Merge image + text => single big vector
+    #--------------------------------------------------------------------------
+    print("[INFO] Merging image+text features ...")
+    X_train_all = np.hstack((X_train_img, X_train_text))
+    X_val_all   = np.hstack((X_val_img,   X_val_text))
+    X_test_all  = np.hstack((X_test_img,  X_test_text))
+
+    y_train_all = y_train_img
+    y_val_all   = y_val_img
+    y_test_all  = y_test_img
+
+    print(f"Final Merged shapes => Train= {X_train_all.shape}, Val= {X_val_all.shape}, Test= {X_test_all.shape}")
+
+    run_all_evaluations(X_train_img,y_train_img,X_val_img,y_val_img,X_test_img,y_test_img) #deep+classical image
+    print("OVER")
+    run_all_evaluations(X_train_text,y_train_text,X_val_text,y_val_text,X_test_text,y_test_text) #text only
+    print("OVER")
+    run_all_evaluations(X_train_classical,y_train_classical,X_val_classical,y_val_classical,X_test_classical,y_test_classical) #only classical
+    print("OVER")
+    run_all_evaluations(X_train_deep,y_train_deep,X_val_deep,y_val_deep,X_test_deep,y_test_deep) #only deep
+    print("OVER")
+    run_all_evaluations(X_train_all,y_train_all,X_val_all,y_val_all,X_test_all,y_test_all) #all
+    print("\n[INFO] Done! End of pipeline.")
+
+if __name__ == "__main__":
+    main_pipeline()
+
+
 
